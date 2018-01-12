@@ -1,0 +1,765 @@
+#!/usr/bin/env bash
+# Derek Moore <derek@ripple.com>
+
+PREFIX=/usr/local
+
+override() {
+    target=${1#USER_}
+    NAME=`echo $2 | sed 's/[^A-Za-z0-9-]/-/g'`
+    eval "${target}=\$${1}"
+}
+
+fullpath() {
+    cd $(dirname $1)
+    echo $PWD/$(basename $1)
+}
+
+##
+## template TEMPLATE_FILE DESTINATION_FILE
+##
+## Performs variable interpolation on TEMPLATE_FILE and copies
+## the result to DESTINATION_FILE. All strings in TEMPLATE_FILE
+## that match {{CA_*}} will be replaced with the contents of the
+## environment variable with the same name.
+##
+template() {
+    local REGEX=""
+    for VAR in ${!CA_*}; do
+        REGEX="${REGEX}s#{{\s*${VAR}\s*}}#${!VAR}#g; "
+    done
+    sed -e "${REGEX}" < $1 > $2
+}
+
+
+##
+## init_ca_home CA_PATH
+##
+## Initializes a CA directory skeleton at PATH
+##
+init_ca_home() {
+    HOME=$1
+
+    # Ensure we're initializing an empty directory
+    if [ -d "${HOME}" ]; then
+	    echo "${HOME} already exists, exiting"
+	    exit 1
+    fi
+
+    if ! mkdir -p "${HOME}"; then
+        echo "Unable to create ${HOME}, exiting"
+	    exit 1
+    fi
+
+    pushd ${HOME} > /dev/null
+
+    # Create top-level CA structure
+    mkdir -p ca
+    mkdir -p ca/db
+    mkdir -p ca/private
+
+    mkdir -p archive
+    mkdir -p bin
+    mkdir -p certs
+    mkdir -p crl
+    mkdir -p conf
+    mkdir -p csr
+    mkdir -p private
+
+    # Secure key directories
+    chmod 0700 ca/private
+    chmod 0700 private
+
+    # Create empty databases
+    touch ca/db/certificate.db
+    touch ca/db/certificate.db.attr
+    echo 01 > ca/db/crt.srl
+    echo 01 > ca/db/crl.srl
+
+    popd > /dev/null
+}
+
+##
+## generate_conf CONF
+##
+## Generate the ca.conf for new root and signing CAs
+##
+generate_conf() {
+    DEST=$1
+
+    if [ -z "${CA_DOMAIN}" ]; then
+        echo -n "Domain name for new CA [${CA_DOMAIN}]: "
+        read DOMAIN
+        if [ -n "${DOMAIN}" ]; then
+            CA_DOMAIN=${DOMAIN}
+        elif [ -z "${CA_DOMAIN}" ]; then
+            echo "Domain is required."
+            exit 1
+        fi
+    fi
+
+    if [ -z "${CA_NAME}" ]; then
+        echo -n "Short label for new CA [${CA_NAME}]: "
+        read NAME
+        if [ -n "${NAME}" ]; then
+            CA_NAME=${NAME}
+            CA_NAME=`echo ${CA_NAME} | sed 's/[^A-Za-z0-9-]/-/g'`
+        fi
+    fi
+    
+    echo
+    echo "CRL URL will be https://${CA_DOMAIN}/ca/${CA_NAME}.crl"
+    echo
+
+    if [ -z "${CA_CERT_C}" ]; then
+        echo -n "Default country code for new certificates [${CA_CERT_C}]: "
+        read CERT_C
+        if [ -n "${CERT_C}" ]; then
+            CA_CERT_C=${CERT_C}
+        fi
+    fi
+
+    if [ -z "${CA_CERT_ST}" ]; then
+        echo -n "Default state for new certificates [${CA_CERT_ST}]: "
+        read CERT_ST
+        if [ -n "${CERT_ST}" ]; then
+            CA_CERT_ST=${CERT_ST}
+        fi
+    fi
+
+    if [ -z "${CA_CERT_L}" ]; then
+        echo -n "Default city for new certificates [${CA_CERT_L}]: "
+        read CERT_L
+        if [ -n "${CERT_L}" ]; then
+            CA_CERT_L=${CERT_L}
+        fi
+    fi
+
+    if [ -z "${CA_CERT_ORG}" ]; then
+        echo -n "Default org for new certificates [${CA_CERT_ORG}]: "
+        read CERT_O
+        if [ -n "${CERT_O}" ]; then
+            CA_CERT_ORG=${CERT_O}
+        fi
+    fi
+
+    if [ -z "${CA_CERT_OU}" ]; then
+        echo -n "Default org unit for new certificates [${CA_CERT_OU}]: "
+        read CERT_OU
+        if [ -n "${CERT_OU}" ]; then
+            CA_CERT_OU=${CERT_OU}
+        fi
+    fi
+
+    CA_CERT_CN="${CA_CERT_ORG} Certificate Authority"
+
+    cat > ${DEST} << EOF
+CA_DOMAIN="${CA_DOMAIN}"
+CA_NAME="${CA_NAME}"
+
+CA_CERT_C="${CA_CERT_C}"
+CA_CERT_ST="${CA_CERT_ST}"
+CA_CERT_L="${CA_CERT_L}"
+CA_CERT_ORG="${CA_CERT_ORG}"
+CA_CERT_OU="${CA_CERT_OU}"
+CA_CERT_CN="${CA_CERT_CN}"
+EOF
+}
+
+usage_root_ca() {
+    echo "Usage: $0 create-root-ca -f CA_DIR -p <file> "
+    echo "Initializes a new root CA in CA_DIR"
+    echo
+    echo "Options:"
+    echo "    -f CA_DIR  Target directory to be created and initialized"
+    echo "    -p CA_PASS_FILE Password file to read "
+    echo "    -d CA_CERT_C Certificate Domain"
+    echo "    -n CA_CERT_C Certificate Name"
+    echo "    -c CA_CERT_C Certificate Country"
+    echo "    -s CA_CERT_ST Certificate State"
+    echo "    -c CA_CERT_L Certificate Locality"
+    echo "    -o CA_CERT_ORG Certificate Organization"
+    echo "    -u CA_CERT_OU Certificate Organization Unit"
+    echo
+    exit 2
+}
+
+create_root_ca() {
+    CA_DIR=
+
+    BIN_DIR=${PREFIX}/etc/ssl
+    [[ -f "${BIN_DIR}/defaults.conf" ]] && source ${BIN_DIR}/defaults.conf
+
+    while getopts c:d:f:l:n:o:p:s:u: FLAG; do
+        case $FLAG in
+            c) CA_CERT_C=${OPTARG} ;;
+            d) CA_DOMAIN=${OPTARG} ;;
+            f) CA_DIR=${OPTARG} ;;
+            l) CA_CERT_L=${OPTARG} ;;
+            n) CA_NAME=${OPTARG} ;;
+            s) CA_CERT_ST=${OPTARG} ;;
+            o) CA_CERT_ORG=${OPTARG} ;;
+            u) CA_CERT_OU=${OPTARG} ;;
+            p) CA_PASS_FILE=${OPTARG} ;;
+            *) 
+                echo "Wrong options"
+                usage_root_ca 
+            ;;
+        esac
+    done
+
+    if [ "${CA_DIR}" == "" ]; then
+        usage_root_ca
+    fi
+
+    HOME=$CA_DIR
+
+    if [ -z "${CA_NAME}" ]; then
+        CA_NAME=$( basename "${HOME}" )
+    fi
+
+    echo
+    echo "Creating root CA in '${HOME}' for ${CA_CERT_ORG}"
+    echo
+
+    init_ca_home ${HOME}
+    generate_conf ${HOME}/defaults.conf
+    [[ -f "${HOME}/defaults.conf" ]] && source ${HOME}/defaults.conf
+
+    if [ -z "${CA_PASS_FILE}" ]; then
+        echo
+        echo -n "Enter passphase for encrypting root CA key: "
+        read -s PASS1
+        echo
+        echo -n "Verifying - Enter passphase for encrypting root CA key: "
+        read -s PASS2
+        echo
+
+        if [ "${PASS1}" != "${PASS2}" ]; then
+            echo "Passphrases did not match, exiting."
+            exit 1
+        fi
+        export CA_PASS=${PASS1}
+    else 
+        export CA_PASS=$( cat ${CA_PASS_FILE} )
+    fi
+    pushd ${HOME} > /dev/null
+
+    # Generate the root CA openssl config
+    template "${BIN_DIR}/templates/root.tpl" "conf/ca.conf"
+
+    # Create the root CA csr
+    openssl genrsa -out ca/private/ca.key -passout env:CA_PASS 4096
+    chmod 0400 ca/private/ca.key
+
+    # Create the root CA csr
+    openssl req -new -batch \
+                -config conf/ca.conf \
+                -key ca/private/ca.key \
+                -out ca/ca.csr \
+                -passin env:CA_PASS
+
+    # Create the root CA certificate
+    openssl ca -selfsign -batch -notext \
+            -config conf/ca.conf \
+            -in ca/ca.csr \
+            -out ca/ca.crt \
+            -days 3652 \
+            -extensions root_ca_ext \
+            -passin env:CA_PASS
+
+    # Create the root CRL
+    openssl ca -gencrl -batch \
+            -config conf/ca.conf \
+            -out crl/ca.crl
+
+
+    popd > /dev/null
+
+    echo
+    echo "Root CA initialized."
+    echo
+}
+
+usage_signing_ca() {
+    echo "Usage: $0 create-signing-ca -f CA_DIR -p <file> -q <file> -d CA_DOMAIN -n CA_NAME -c CA_CERT_C -s CA_CERT_ST -l CA_CERT_L -o CA_CERT_ORG -u CA_CERT_OU"
+    echo "Initializes a new signing sub-CA in CA_DIR"
+    echo
+    echo "Options:"
+    echo "    -f CA_DIR  Target directory to be created and initialized"
+    echo "    -p CA_PASS_FILE Certificate Authority Password file to read "
+    echo "    -q CA_PARENT_PASS_FILE Parent Certificate Authority Password file to read "
+    echo "    -d CA_CERT_C Certificate Domain"
+    echo "    -n CA_CERT_C Certificate Name"
+    echo "    -c CA_CERT_C Certificate Country"
+    echo "    -s CA_CERT_ST Certificate State"
+    echo "    -l CA_CERT_L Certificate Locality"
+    echo "    -o CA_CERT_ORG Certificate Organization"
+    echo "    -u CA_CERT_OU Certificate Organization Unit"
+    echo
+    exit 2
+}
+
+create_signing_ca() {
+    CA_DIR=
+    
+    BIN_DIR=${PREFIX}/etc/ssl
+    [[ -f "${BIN_DIR}/defaults.conf" ]] && source ${PREFIX}/etc/ssl/defaults.conf
+
+    while getopts c:d:f:l:n:o:p:q:s:u: FLAG; do
+        case $FLAG in
+            c) CA_CERT_C=${OPTARG} ;;
+            d) CA_DOMAIN=${OPTARG} ;;
+            f) CA_DIR=${OPTARG} ;;
+            l) CA_CERT_L=${OPTARG} ;;
+            n) CA_NAME=${OPTARG} ;;
+            s) CA_CERT_ST=${OPTARG} ;;
+            o) CA_CERT_ORG=${OPTARG} ;;
+            u) CA_CERT_OU=${OPTARG} ;;
+            p) CA_PASS_FILE=${OPTARG} ;;
+            q) CA_PARENT_PASS_FILE=${OPTARG} ;;
+            *) usage_signing_ca ;;
+        esac
+    done
+
+    if [ "${CA_DIR}" == "" ]; then
+        usage_signing_ca
+    fi
+
+    HOME=$CA_DIR
+    PARENT=${HOME}/..
+    CA_NAME=$( basename "${HOME}" )
+
+    echo
+    echo "Creating new signing sub-CA in '${HOME}'"
+    echo
+
+    init_ca_home ${HOME}
+    generate_conf ${HOME}/defaults.conf
+    source ${HOME}/defaults.conf
+
+    if [ -z "${CA_PASS_FILE}" ]; then
+        echo
+        echo -n "Enter passphase for encrypting signing CA key: "
+        read -s PASS1
+        echo
+        echo -n "Verifying - Enter passphase for encrypting signing CA key: "
+        read -s PASS2
+        echo
+
+        if [ "${PASS1}" != "${PASS2}" ]; then
+            echo "Passphrases did not match, exiting."
+            exit 1
+        fi
+        export CA_PASS=${PASS1}
+    else
+        export CA_PASS=$( cat ${CA_PASS_FILE} )
+    fi
+
+    if [ -z "${CA_PARENT_PASS_FILE}" ]; then
+        echo
+        echo -n "Enter passphase for root CA key: "
+        read -s PARENT_PASS
+        echo
+        export CA_PARENT_PASS=${PARENT_PASS}
+    else   
+        export CA_PARENT_PASS=$( cat ${CA_PARENT_PASS_FILE} )
+    fi
+
+    # Fully-qualify home to we can return to it later
+    HOME=$( cd "${HOME}" && pwd )
+
+    pushd ${HOME} > /dev/null
+
+    # Generate the signing CA openssl config
+    template "${BIN_DIR}/templates/signing.tpl" "conf/ca.conf"
+
+    # Create the signing CA key
+    openssl genrsa -out ca/private/ca.key -passout env:CA_PASS 2048
+    chmod 0400 ca/private/ca.key
+
+    # Create the signing CA csr
+    openssl req -new -batch \
+                -config conf/ca.conf \
+                -key ca/private/ca.key \
+                -out ca/ca.csr \
+                -passin env:CA_PASS
+
+    # Create the signing CA certificate
+    pushd ${PARENT} > /dev/null
+    openssl ca -batch -notext \
+            -config conf/ca.conf \
+            -in ${HOME}/ca/ca.csr \
+            -out ${HOME}/ca/ca.crt \
+            -days 3652 \
+            -extensions signing_ca_ext \
+            -passin env:CA_PARENT_PASS
+    popd > /dev/null
+
+    # Create the signing CRL
+    openssl ca -gencrl -batch \
+            -config conf/ca.conf \
+            -out crl/ca.crl
+
+    # Create the chain bundle if this is a sub-CA
+    if [ -f "${PARENT}/ca/chain.pem" ]; then
+        cat ${PARENT}/ca/chain.pem > ca/chain.pem
+    fi
+    cat ca/ca.crt >> ca/chain.pem
+
+    popd > /dev/null
+
+    echo
+    echo "Signing sub-CA initialized."
+    echo
+}
+
+usage_server() {
+    echo "Usage: $0 create-server -f <dir> -p <file> -s SERVER_NAME [-a ALT_NAME]..."
+    echo "Issues a server certificate for SERVER_NAME"
+    echo
+    echo "Options:"
+    echo "    -f CA_DIR  Target directory to be created and initialized"
+    echo "    -p CA_PASS_FILE Certificate Authority Password File"
+    echo "    -s SERVER_NAME  Server hostname commonName for the new cert"
+    echo "    -a ALT_NAME     One or more subjectAltNames for the new cert - optional"
+    echo
+    exit 2
+}
+
+create_server() {
+    SERVER_NAME=
+    ALT_NAME=
+    CA_DIR=
+    while getopts f:p:s:a: FLAG; do
+        case $FLAG in
+            f) CA_DIR=${OPTARG} ;;
+            p) CA_PASS_FILE=${OPTARG} ;;
+            s) SERVER_NAME=${OPTARG}
+            if [ -z "${ALT_NAME}" ]; then
+                ALT_NAME="DNS:${OPTARG}"
+            else
+                ALT_NAME="${ALT_NAME}, DNS:${OPTARG}"
+            fi
+            ;;
+            a) if [ -z "${ALT_NAME}" ]; then
+                ALT_NAME="DNS:${OPTARG}"
+            else
+                ALT_NAME="${ALT_NAME}, DNS:${OPTARG}"
+            fi
+            ;;
+            *) usage_server
+            ;;
+        esac
+    done
+
+    if [ "${SERVER_NAME}" == "" ]; then
+        usage_server
+    fi
+
+    BIN_DIR=${PREFIX}/etc/ssl
+    [[ -f "${BIN_DIR}/defaults.conf" ]] && source ${BIN_DIR}/defaults.conf
+
+    # Sanitize the commonName to make it suitable for use in filenames
+    SAFE_NAME=`echo ${SERVER_NAME} | sed 's/\*/star/g'`
+    SAFE_NAME=`echo ${SAFE_NAME} | sed 's/[^A-Za-z0-9-]/-/g'`
+
+    echo
+    echo "Creating new SSL server certificate for:"
+    echo "commonName: ${SERVER_NAME}"
+    echo "subjectAltName: ${ALT_NAME}"
+    echo
+
+    pushd ${CA_DIR} > /dev/null
+
+    if [ -f conf/${SAFE_NAME}.server.conf ]; then
+        echo "Configuration already exists for '${SERVER_NAME}', exiting."
+        exit 1
+    fi
+
+    if [ -z "${CA_PASS_FILE}" ]; then
+        echo -n "Enter passphase for signing CA key: "
+        read -s PASS
+        echo
+        export CA_PASS=${PASS}
+    else
+        export CA_PASS=$( cat ${CA_PASS_FILE} )
+    fi
+
+    # Generate the server openssl config
+    export CA_HOSTNAME=${SERVER_NAME}
+    export CA_ALTNAME=${ALT_NAME}
+    template "${BIN_DIR}/templates/server.tpl" "conf/${SAFE_NAME}.server.conf"
+
+    # Create the server key and csr
+    openssl req -new -nodes \
+                -config conf/${SAFE_NAME}.server.conf \
+                -keyout private/${SAFE_NAME}.server.key \
+                -out csr/${SAFE_NAME}.server.csr
+    chmod 0400 private/${SAFE_NAME}.server.key
+
+    # Create the server certificate
+    openssl ca -batch -notext \
+            -config conf/ca.conf \
+            -in csr/${SAFE_NAME}.server.csr \
+            -out certs/${SAFE_NAME}.server.crt \
+            -days 730 \
+            -extensions server_ext \
+            -passin env:CA_PASS
+
+    popd > /dev/null
+
+    echo
+    echo "Server certificate created."
+    echo
+}
+
+usage_client() {
+    echo "Usage: $0 create-client -f <dir> -p <file> -c CLIENT_NAME"
+    echo "Issues a client certificate for CLIENT_NAME"
+    echo
+    echo "Options:"
+    echo "    -f CA_DIR  Target directory to be created and initialized"
+    echo "    -p CA_PASS_FILE Certificate Authority Password File"
+    echo "    -c CLIENT_NAME  Client name commonName for the new cert"
+    echo
+    exit 2
+}
+
+create_client() {
+    CLIENT_NAME=
+
+    while getopts f:p:c: FLAG; do
+        case $FLAG in
+            f) CA_DIR=${OPTARG} ;;
+            p) CA_PASS_FILE=${OPTARG} ;;
+            c) CLIENT_NAME=${OPTARG} ;;
+            *) usage_client ;;
+        esac
+    done
+
+    if [ "${CLIENT_NAME}" == "" ]; then
+        usage_client
+    fi
+
+    BIN_DIR=${PREFIX}/etc/ssl
+    [[ -f "${BIN_DIR}/defaults.conf" ]] && source ${BIN_DIR}/defaults.conf
+
+    SAFE_NAME=`echo $CLIENT_NAME | sed 's/\*/star/g'`
+    SAFE_NAME=`echo $SAFE_NAME | sed 's/[^A-Za-z0-9-]/-/g'`
+
+    echo
+    echo "Creating new client certificate for '${CLIENT_NAME}'"
+    echo
+
+    pushd ${CA_DIR} > /dev/null
+
+    if [ -f conf/${SAFE_NAME}.client.conf ]; then
+        echo "Configuration already exists for '${CLIENT_NAME}', exiting."
+        exit 1
+    fi
+
+    if [ -z "${CA_PASS_FILE}" ]; then
+        echo -n "Enter passphase for signing CA key: "
+        read -s PASS
+        echo
+        export CA_PASS=${PASS}
+    else
+        export CA_PASS=$( cat ${CA_PASS_FILE} )
+    fi
+
+    # Generate the client cert openssl config
+    export SAN=""
+    export CA_USERNAME=${CLIENT_NAME}
+    template "${BIN_DIR}/templates/client.tpl" "conf/${SAFE_NAME}.client.conf"
+
+    # Create the client key and csr
+    openssl req -new -nodes \
+                -config conf/${SAFE_NAME}.client.conf \
+                -keyout private/${SAFE_NAME}.client.key \
+                -out csr/${SAFE_NAME}.client.csr
+    chmod 0400 private/${SAFE_NAME}.client.key
+
+    # Create the client certificate
+    openssl ca -batch -notext \
+            -config conf/ca.conf \
+            -in csr/${SAFE_NAME}.client.csr \
+            -out certs/${SAFE_NAME}.client.crt \
+            -days 730 \
+            -extensions client_ext \
+            -passin env:CA_PASS
+
+    popd > /dev/null
+
+    echo
+    echo "Client certificate created."
+    echo
+}
+
+
+usage_revoke_cert() {
+    echo "Usage: $0 revoke-cert -f <dir> -r <reason> -c CERT"
+    echo "Revokes a certificate issued by this CA"
+    echo
+    echo "Options:"
+    echo "    -f CA_DIR  Target directory to be created and initialized"
+    echo "    -r REASON Certificate Revoke Reason"
+    echo "    -c CERT  Path the the certificate file to be revoked"
+    echo
+    exit 2
+}
+
+revoke_cert() {
+    CERT=
+
+    while getopts f:r:c: FLAG; do
+        case $FLAG in
+            f) CA_DIR=${OPTARG} ;;
+            r) REASON=${OPTARG} ;;
+            c) CERT=${OPTARG} ;;
+            *) usage ;;
+        esac
+    done
+
+    if [ "${CERT}" == "" ]; then
+        usage_revoke_cert
+    fi
+
+    BIN_DIR=$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )
+    source ${BIN_DIR}/functions
+    source ${BIN_DIR}/defaults.conf
+
+    echo
+    echo "Revoking certificate '${CERT}'"
+    echo
+
+    if [ ! -f "${CERT}" ]; then
+        echo "Could not read certificate '${CERT}', exiting."
+        exit 1
+    fi
+
+    # Fully-qualify path to cert
+    CERT=$( fullpath ${CERT} )
+
+    pushd ${BIN_DIR}/.. > /dev/null
+
+    if [ -z "${REASON}" ]; then
+        echo "Reason for revocation: "
+        echo
+        echo "1. unspecified"
+        echo "2. keyCompromise"
+        echo "3. CACompromise"
+        echo "4. affiliationChanged"
+        echo "5. superseded"
+        echo "6. cessationOfOperation"
+        echo "7. certificateHold"
+        echo
+        echo -n "Enter 1-7 [1]: "
+        read INDEX
+
+        [ -z "${INDEX}" ] && INDEX="1"
+
+        case $INDEX in
+            1) REASON="unspecified" ;;
+            2) REASON="keyCompromise" ;;
+            3) REASON="CACompromise" ;;
+            4) REASON="affiliationChanged" ;;
+            5) REASON="superseded" ;;
+            6) REASON="cessationOfOperation" ;;
+            7) REASON="certificateHold" ;;
+            8) echo "Unknown reason, exiting."; exit 1 ;;
+        esac
+
+        echo "You are about to revoke this certificate with reason '${REASON}'."
+        echo -n "Are you SURE you wish to continue? [y/N]: "
+        read SURE
+        if [ "${SURE}" != "y" -a "${SURE}" != "Y" ]; then
+            echo "Exiting."
+            exit 1
+        fi
+    fi
+
+    # Revoke the certificate
+    openssl ca \
+            -config conf/ca.conf \
+            -revoke ${CERT} \
+            -crl_reason ${REASON}
+
+    # Regenerate the CRL
+    openssl ca -gencrl \
+            -config conf/ca.conf \
+            -out crl/ca.crl
+
+    popd > /dev/null
+
+    echo
+    echo "Server certificate revoked."
+    echo
+}
+
+usage_main() {
+    echo "easy-ca 1.0"
+    echo "Manage Certificate Authority"
+    echo
+    echo "Operations:"
+    echo "    create-root-ca"
+    echo "    create-signing-ca"
+    echo "    create-server"
+    echo "    create-client"
+    echo "    revoke-cert"
+    echo "    defaults"
+    echo
+    exit 2
+}
+
+usage_defaults() {
+    echo "Usage: $0 defaults [-x] $VAR=<value>"
+    echo "Change global defaults variables"
+    echo
+    echo "Variables:"
+    echo "	CA_DOMAIN 	Default Domain"
+    echo "	CA_NAME 	Default Name"
+    echo "	CA_CERT_C 	Default Country"
+    echo "	CA_CERT_ST	Default State"
+    echo "	CA_CERT_L	Default Locality"
+    echo "	CA_CERT_ORG	Default Organization"
+    echo "	CA_CERT_OU	Default Orginization Unit"
+    echo
+    exit 2
+}
+
+set_defaults() {
+	if [ -z "$1" ]; then
+		usage_defaults
+	fi
+	sysrc -f ${PREFIX}/etc/ssl/defaults.conf $@
+}
+
+main() {
+    ACTION=$1
+    shift
+    case ${ACTION} in
+        create-root-ca)
+            create_root_ca $@
+        ;;
+        create-signing-ca)
+            create_signing_ca $@
+        ;;
+        create-server)
+            create_server $@
+        ;;
+        create-client)
+            create_client $@
+        ;;
+        revoke-cert)
+            revoke_cert $@
+        ;;
+	defaults)
+	    set_defaults $@
+	;;
+        *)
+            usage_main
+    esac
+}
+
+main $@
+

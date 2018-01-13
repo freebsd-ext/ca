@@ -628,10 +628,9 @@ revoke_cert() {
         usage_revoke_cert
     fi
 
-    BIN_DIR=$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )
-    source ${BIN_DIR}/functions
-    source ${BIN_DIR}/defaults.conf
-
+    BIN_DIR=${PREFIX}/etc/ssl
+    [[ -f "${BIN_DIR}/defaults.conf" ]] && source ${BIN_DIR}/defaults.conf
+    
     echo
     echo "Revoking certificate '${CERT}'"
     echo
@@ -644,7 +643,9 @@ revoke_cert() {
     # Fully-qualify path to cert
     CERT=$( fullpath ${CERT} )
 
-    pushd ${BIN_DIR}/.. > /dev/null
+    [[ -f "${CA_DIR}/defaults.conf" ]] && source ${CA_DIR}/defaults.conf
+
+    pushd ${CA_DIR} > /dev/null
 
     if [ -z "${REASON}" ]; then
         echo "Reason for revocation: "

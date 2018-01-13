@@ -469,6 +469,8 @@ create_server() {
     echo "subjectAltName: ${ALT_NAME}"
     echo
 
+    [[ -f "${CA_DIR}/defaults.conf" ]] && source ${CA_DIR}/defaults.conf
+
     pushd ${CA_DIR} > /dev/null
 
     if [ -f conf/${SAFE_NAME}.server.conf ]; then
@@ -550,6 +552,8 @@ create_client() {
     echo
     echo "Creating new client certificate for '${CLIENT_NAME}'"
     echo
+
+    [[ -f "${CA_DIR}/defaults.conf" ]] && source ${CA_DIR}/defaults.conf
 
     pushd ${CA_DIR} > /dev/null
 
